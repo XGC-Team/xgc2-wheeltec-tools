@@ -4,6 +4,8 @@
 # Onboard PCIe Wi-Fi is unusable as SSH / GCS. This script only writes the
 # USB card. Does not run `nmcli connection up`. Does not ping. Does not ifup.
 # From --lan-address A.B.C.D it also writes bridge peers .151 / .251.
+# After this runs, the field USB profile is the only Wi-Fi profile that
+# autoconnects. Leftover SSIDs on the same USB iface must not win a boot race.
 #
 # Usage:
 #   sudo bash configure-network.sh --yes --lan-address 192.168.51.11X
@@ -42,6 +44,10 @@ CMD_VEL_PORT="${WHEELTEC_CMD_VEL_PORT:-}"
 BRIDGE_YAML="/etc/xgc2/wheeltec/ros_topics.yaml"
 GCS_PEER_ARGS=()
 GCS_IPS=()
+# Leftover USB Wi-Fi profiles were often saved at the same priority as the
+# field profile, so NetworkManager raced at boot. Field USB must outrank
+# them and be the only Wi-Fi autoconnect.
+FIELD_WIFI_AUTOCONNECT_PRIORITY=400
 
 usage() {
   cat <<'EOF'
@@ -442,6 +448,21 @@ active_wifi_on_iface() {
     | awk -F: -v iface="${iface}" '$2 == "802-11-wireless" && $3 == iface { print $1; exit }'
 }
 
+# Same-SSID demotion is not enough: a leftover USB profile for another AP
+# (same iface, same leftover priority) still wins the boot race.
+demote_competing_wifi_profiles() {
+  local keep="$1"
+  local name type
+  while IFS=: read -r name type; do
+    [[ "${type}" == "802-11-wireless" ]] || continue
+    [[ -n "${name}" && "${name}" != "${keep}" ]] || continue
+    nmcli connection modify "${name}" \
+      connection.autoconnect no \
+      connection.autoconnect-priority 0
+    log "disable competing Wi-Fi autoconnect '${name}'"
+  done < <(nmcli -t -f NAME,TYPE connection show)
+}
+
 apply_static_ipv4() {
   local profile="$1"
   local cidr="$2"
@@ -455,7 +476,7 @@ apply_static_ipv4() {
     802-11-wireless.mac-address "" \
     802-11-wireless.cloned-mac-address "" \
     connection.autoconnect yes \
-    connection.autoconnect-priority 200 \
+    connection.autoconnect-priority "${FIELD_WIFI_AUTOCONNECT_PRIORITY}" \
     ipv4.method manual \
     ipv4.addresses "${cidr}" \
     ipv4.gateway "${LAN_GATEWAY}" \
@@ -527,7 +548,7 @@ else
   nmcli connection add type wifi ifname "${WIFI_IFACE}" con-name "${WIFI_SSID}" \
     ssid "${WIFI_SSID}" \
     connection.autoconnect yes \
-    connection.autoconnect-priority 200 \
+    connection.autoconnect-priority "${FIELD_WIFI_AUTOCONNECT_PRIORITY}" \
     802-11-wireless-security.key-mgmt wpa-psk \
     802-11-wireless-security.psk "${WIFI_PASSWORD}" \
     ipv4.method manual \
@@ -538,6 +559,7 @@ else
   profile="${WIFI_SSID}"
   apply_static_ipv4 "${profile}" "${cidr}"
 fi
+demote_competing_wifi_profiles "${profile}"
 log "NM saved ${profile} on ${WIFI_IFACE} -> ${cidr} gw ${LAN_GATEWAY} dns ${LAN_DNS}"
 apply_live_ipv4_prefix "${WIFI_IFACE}" "${cidr}"
 resolve_gcs_peers
