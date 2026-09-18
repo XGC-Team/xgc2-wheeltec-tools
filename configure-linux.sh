@@ -437,6 +437,61 @@ quarantine_matching_update_log() {
   [[ "${quarantined}" -eq 1 ]]
 }
 
+apt_update_is_lock() {
+  grep -Eq 'Could not get lock|Unable to lock directory|Unable to lock the administration directory|无法获得锁|Resource temporarily unavailable' "$1"
+}
+
+apt_update_is_clock() {
+  grep -Eq 'not valid yet|Release file .* expired|Release 文件已经过期|Clock skew detected'
+}
+
+http_date_from_headers() {
+  tr -d '\r' | grep -i '^Date:' | head -n1 | cut -d' ' -f2-
+}
+
+wait_dpkg_lock() {
+  local n=0
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+    || fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
+    || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+    || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    n=$((n + 1))
+    if [[ "${n}" -gt 60 ]]; then
+      die "apt/dpkg lock still held after 120s"
+    fi
+    log "wait apt/dpkg lock (${n})"
+    sleep 2
+  done
+}
+
+sync_clock_from_http() {
+  local url hdr epoch_http epoch_now skew
+  url="${APT_BASE_URL%/}/dists/${APT_SUITE}/InRelease"
+  hdr="$(curl -sI --connect-timeout 8 --max-time 15 "${url}" 2>/dev/null \
+    | http_date_from_headers)"
+  if [[ -z "${hdr}" ]]; then
+    warn "no HTTP Date from apt; leave companion clock"
+    return 0
+  fi
+  epoch_http="$(date -u -d "${hdr}" +%s 2>/dev/null || true)"
+  epoch_now="$(date -u +%s)"
+  if [[ -z "${epoch_http}" ]]; then
+    warn "could not parse apt HTTP Date: ${hdr}"
+    return 0
+  fi
+  skew=$(( epoch_now - epoch_http ))
+  if [[ "${skew}" -lt 0 ]]; then
+    skew=$(( -skew ))
+  fi
+  if [[ "${skew}" -lt 3600 ]]; then
+    log "companion clock skew ${skew}s; leave it"
+    return 0
+  fi
+  date -u -s "$(date -u -d "${hdr}" '+%Y-%m-%d %H:%M:%S')" >/dev/null
+  log "set clock from apt HTTP Date (${hdr}); was ${skew}s off"
+  sleep 3
+}
+
 apt_update_resilient() {
   local attempt=1
   local max_attempts=8
@@ -458,6 +513,23 @@ apt_update_resilient() {
       return 0
     fi
     cat "${logf}" >&2 || true
+    if apt_update_is_lock "${logf}"; then
+      rm -f "${logf}"
+      log "apt lock busy; wait and retry"
+      wait_dpkg_lock
+      sleep 3
+      attempt=$((attempt + 1))
+      continue
+    fi
+    if apt_update_is_clock "${logf}"; then
+      rm -f "${logf}"
+      log "apt InRelease rejected as expired/not-yet-valid; resync clock"
+      sync_clock_from_http
+      wait_dpkg_lock
+      sleep 2
+      attempt=$((attempt + 1))
+      continue
+    fi
     if [[ "${SKIP_QUARANTINE_SOURCES}" -ne 0 ]]; then
       rm -f "${logf}"
       die "apt-get update failed and --skip-quarantine-sources is set"
@@ -503,7 +575,10 @@ install_stack() {
     "ros-melodic-xgc2-wheeltec-onboard"
   )
   local pkg
+  sync_clock_from_http
+  wait_dpkg_lock
   apt_update_resilient
+  wait_dpkg_lock
   log "apt-get install -y --no-install-recommends ${pkgs[*]}"
   # Unrelated broken nvidia-l4t / TeamViewer packages make apt-get return 100
   # even after our debs unpack. Upgrade still happens; we only require our pkgs.
